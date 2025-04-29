@@ -1,3 +1,4 @@
+use hyper::http;
 #[cfg(feature = "rustls")]
 pub struct RuslsConfigs {
     no_alpn: std::sync::Arc<rustls::ClientConfig>,
@@ -43,6 +44,9 @@ impl RuslsConfigs {
                 .dangerous()
                 .set_certificate_verifier(Arc::new(AcceptAnyServerCert));
         }
+        if std::env::var("SSLKEYLOGFILE").is_ok() {
+            config.key_log = Arc::new(rustls::KeyLogFile::new());
+        }
 
         let mut no_alpn = config.clone();
         no_alpn.alpn_protocols = vec![];
@@ -54,11 +58,11 @@ impl RuslsConfigs {
         }
     }
 
-    pub fn config(&self, is_http2: bool) -> &std::sync::Arc<rustls::ClientConfig> {
-        if is_http2 {
-            &self.alpn_h2
-        } else {
-            &self.no_alpn
+    pub fn config(&self, http: http::Version) -> &std::sync::Arc<rustls::ClientConfig> {
+        match http {
+            http::Version::HTTP_09 | http::Version::HTTP_10 | http::Version::HTTP_11 => &self.no_alpn,
+            http::Version::HTTP_2 => &self.alpn_h2,
+            _ => panic!("nonsupported HTTP version")
         }
     }
 }
