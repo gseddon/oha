@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http_body_util::{BodyExt, Full};
 use hyper::{Method, http};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -21,14 +21,23 @@ use tokio::{
 use url::{ParseError, Url};
 
 use crate::{
-    ConnectToEntry,
     aws_auth::AwsSignatureConfig,
     pcg64si::Pcg64Si,
     url_generator::{UrlGenerator, UrlGeneratorError},
+    ConnectToEntry,
 };
+
+#[cfg(feature = "http3")]
+use crate::client_h3::{parallel_work_http3, spawn_http3_driver};
+
 
 type SendRequestHttp1 = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
 type SendRequestHttp2 = hyper::client::conn::http2::SendRequest<Full<Bytes>>;
+#[cfg(feature = "http3")]
+pub type SendRequestHttp3 = (
+    h3::client::Connection<h3_quinn::Connection, Bytes>,
+    h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+);
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectionTime {
@@ -69,6 +78,8 @@ impl RequestResult {
 enum HttpWorkType {
     H1,
     H2,
+    #[cfg(feature = "http3")]
+    H3,
 }
 
 pub struct Dns {
@@ -179,6 +190,21 @@ pub enum ClientError {
     UrlParseError(#[from] ParseError),
     #[error("AWS SigV4 signature error: {0}")]
     SigV4Error(&'static str),
+    #[cfg(feature = "http3")]
+    #[error("Quic No initial cipher suite")]
+    QuicClientConfigError(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
+    #[cfg(feature = "http3")]
+    #[error("Quic connect error")]
+    QuicConnectError(#[from] quinn::ConnectError),
+    #[cfg(feature = "http3")]
+    #[error("Quic connection error")]
+    QuicConnectionError(#[from] quinn::ConnectionError),
+    #[cfg(feature = "http3")]
+    #[error("H3 Error")]
+    H3Error(#[from] h3::Error),
+    #[cfg(feature = "http3")]
+    #[error("Quic connection closed earlier than expected")]
+    QuicDriverClosedEarlyError(#[from] tokio::sync::oneshot::error::RecvError),
 }
 
 pub struct Client {
@@ -273,6 +299,8 @@ pub (crate) enum Stream {
     Unix(tokio::net::UnixStream),
     #[cfg(feature = "vsock")]
     Vsock(tokio_vsock::VsockStream),
+    #[cfg(feature = "http3")]
+    Quic(quinn::Connection)
 }
 
 impl Stream {
@@ -320,6 +348,10 @@ impl Stream {
                 }
                 Ok(send_request)
             }
+            #[cfg(feature = "http3")]
+            Stream::Quic(_) => {
+                panic!("quic is not supported in http1")
+            }
         }
     }
     async fn handshake_http2(self) -> Result<SendRequestHttp2, ClientError> {
@@ -351,6 +383,10 @@ impl Stream {
                 let (send_request, conn) = builder.handshake(TokioIo::new(stream)).await?;
                 tokio::spawn(conn);
                 Ok(send_request)
+            }
+            #[cfg(feature = "http3")]
+            Stream::Quic(_) => {
+                panic!("quic is not supported in http2")
             }
         }
     }
@@ -390,6 +426,10 @@ impl Client {
 
     // slightly naughty reusing the HTTP version (there are different versions of 1)
     fn work_type(&self) -> HttpWorkType {
+        #[cfg(feature = "http3")]
+        if self.http_version == http::Version::HTTP_3 {
+            return HttpWorkType::H3;
+        }
         if self.is_work_http2() {
             HttpWorkType::H2
         } else {
@@ -436,6 +476,17 @@ impl Client {
         // TODO: Allow the connect timeout to be configured
         let timeout_duration = tokio::time::Duration::from_secs(5);
 
+        #[cfg(feature = "http3")]
+        if http_version == http::Version::HTTP_3 {
+            let addr = self.dns.lookup(url, rng).await?;
+            let dns_lookup = Instant::now();
+            let stream = tokio::time::timeout(timeout_duration, self.quic_client(addr, url)).await;
+            return match stream {
+                Ok(Ok(stream)) => Ok((dns_lookup, stream)),
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(ClientError::Timeout),
+            };
+        }
         if url.scheme() == "https" {
             let addr = self.dns.lookup(url, rng).await?;
             let dns_lookup = Instant::now();
@@ -920,7 +971,7 @@ impl Client {
 }
 
 /// Check error and decide whether to cancel the connection
-fn is_cancel_error(res: &Result<RequestResult, ClientError>) -> bool {
+pub (crate) fn is_cancel_error(res: &Result<RequestResult, ClientError>) -> bool {
     matches!(res, Err(ClientError::Deadline)) || is_too_many_open_files(res)
 }
 
@@ -976,13 +1027,13 @@ async fn work_http2_once(
     (is_cancel, is_reconnect)
 }
 
-fn set_connection_time<E>(res: &mut Result<RequestResult, E>, connection_time: ConnectionTime) {
+pub (crate) fn set_connection_time<E>(res: &mut Result<RequestResult, E>, connection_time: ConnectionTime) {
     if let Ok(res) = res {
         res.connection_time = Some(connection_time);
     }
 }
 
-fn set_start_latency_correction<E>(
+pub (crate) fn set_start_latency_correction<E>(
     res: &mut Result<RequestResult, E>,
     start_latency_correction: std::time::Instant,
 ) {
@@ -1001,8 +1052,47 @@ pub async fn work_debug<W: Write>(w: &mut W, client: Arc<Client>) -> Result<(), 
     writeln!(w, "{:#?}", request)?;
 
     let response = match client.work_type() {
+        #[cfg(feature = "http3")]
+        HttpWorkType::H3 => {
+            let(_, (h3_connection, mut client_state)) = client.connect_http3(&url, &mut rng).await?;
+
+            // Prepare a channel to stop the driver thread
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            // Run the driver
+            let http3_driver = spawn_http3_driver(h3_connection, shutdown_rx).await;
 
 
+            let (head, mut req_body) = request.into_parts();
+            let request = http::request::Request::from_parts(head, ());
+
+            let mut stream = client_state.send_request(request).await?;
+            match req_body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        stream.send_data(data).await?;
+                    }
+                }
+                _ => {}
+            }
+
+            stream.finish().await?;
+
+            let response = stream.recv_response().await.unwrap_or_else(|err| {
+                panic!("{}", err);
+            });
+            let mut body_bytes = bytes::BytesMut::new();
+
+            while let Some(mut chunk) = stream.recv_data().await? {
+                let bytes = chunk.copy_to_bytes(chunk.remaining());
+                body_bytes.extend_from_slice(&bytes);
+            }
+            let body = body_bytes.freeze();
+            let _ = shutdown_tx.send(0);
+            let _ = http3_driver.await.unwrap();
+            let (parts, _) = response.into_parts();
+            http::Response::from_parts(parts, body)
+
+        }
         HttpWorkType::H2 => {
             let (_, mut client_state) = client.connect_http2(&url, &mut rng).await?;
             let response = client_state.send_request(request).await?;
@@ -1050,6 +1140,8 @@ pub async fn work(
     let futures = match client.work_type()  {
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx, client, None).await,
         HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
+        #[cfg(feature = "http3")]
+        HttpWorkType::H3 => parallel_work_http3(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
     };
     n_tasks_emitter.await.unwrap();
     for f in futures {
@@ -1108,6 +1200,8 @@ pub async fn work_with_qps(
     let futures = match client.work_type()  {
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx, client, None).await,
         HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
+        #[cfg(feature = "http3")]
+        HttpWorkType::H3 => parallel_work_http3(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
     };
     work_queue.await.unwrap();
     for f in futures {
@@ -1317,6 +1411,8 @@ pub async fn work_with_qps_latency_correction(
     let futures = match client.work_type()  {
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx, client, None).await,
         HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
+        #[cfg(feature = "http3")]
+        HttpWorkType::H3 => parallel_work_http3(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
     };
     work_queue.await.unwrap();
     for f in futures {
@@ -1338,6 +1434,8 @@ pub async fn work_until(
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let emitter_handle = endless_emitter(cancel_token.clone(), tx).await;
     let futures = match client.work_type() {
+        #[cfg(feature = "http3")]
+        HttpWorkType::H3 => parallel_work_http3(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
         HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
     };
@@ -1434,6 +1532,8 @@ pub async fn work_until_with_qps(
 
     let rx = rx.to_async();
     let futures = match client.work_type() {
+        #[cfg(feature = "http3")]
+        HttpWorkType::H3 => parallel_work_http3(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
         HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
     };
@@ -1504,6 +1604,8 @@ pub async fn work_until_with_qps_latency_correction(
 
     let rx = rx.to_async();
     let futures = match client.work_type() {
+        #[cfg(feature = "http3")]
+        HttpWorkType::H3 => parallel_work_http3(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
         HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
     };
@@ -1546,6 +1648,9 @@ pub mod fast {
         }, result_data::ResultData
     };
 
+    #[cfg(feature = "http3")]
+    use crate::client_h3::http3_connection_fast_work_until;
+
     use super::Client;
 
     /// Run n tasks by m workers
@@ -1586,6 +1691,8 @@ pub mod fast {
             // will let is_end just stay false permanently
             let is_end = Arc::new(AtomicBool::new(false));
             std::thread::spawn(move || match client.work_type() {
+                #[cfg(feature = "http3")]
+                HttpWorkType::H3 => http3_connection_fast_work_until(n_connections, n_http2_parallel, report_tx, client, token, is_end, counter, Some(n_tasks), rt),
                 HttpWorkType::H2 => http2_connection_fast_work_until(num_connections, n_http2_parallel, report_tx, client, token, is_end, counter, Some(n_tasks), rt),
                 HttpWorkType::H1 => http1_connection_fast_work_until(num_connections, report_tx, client, token, counter, Some(n_tasks), is_end, rt)
             })
@@ -1644,6 +1751,8 @@ pub mod fast {
                 // need a counter even 
                 let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 std::thread::spawn(move || match client.work_type() {
+                    #[cfg(feature = "http3")]
+                    HttpWorkType::H3 => http3_connection_fast_work_until(num_connections, n_http_parallel, report_tx, client, token, is_end, counter, None, rt),
                     HttpWorkType::H2 => http2_connection_fast_work_until(num_connections, n_http_parallel, report_tx, client, token, is_end, counter, None, rt),
                     HttpWorkType::H1 => http1_connection_fast_work_until(num_connections, report_tx, client, token, counter, None, is_end, rt)
                 })
