@@ -1,4 +1,3 @@
-use hyper::http;
 #[cfg(feature = "rustls")]
 pub struct RuslsConfigs {
     no_alpn: std::sync::Arc<rustls::ClientConfig>,
@@ -55,11 +54,12 @@ impl RuslsConfigs {
         }
     }
 
-    pub fn config(&self, http: http::Version) -> &std::sync::Arc<rustls::ClientConfig> {
+    pub fn config(&self, http: hyper::http::Version) -> &std::sync::Arc<rustls::ClientConfig> {
+        use hyper::http::Version;
         match http {
-            http::Version::HTTP_09 | http::Version::HTTP_10 | http::Version::HTTP_11 => &self.no_alpn,
-            http::Version::HTTP_2 => &self.alpn_h2,
-            _ => panic!("nonsupported HTTP version")
+            Version::HTTP_09 | Version::HTTP_10 | Version::HTTP_11 => &self.no_alpn,
+            Version::HTTP_2 => &self.alpn_h2,
+            _ => panic!("nonsupported HTTP version"),
         }
     }
 }

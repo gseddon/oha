@@ -263,7 +263,7 @@ pub enum QueryLimit {
 
 // To avoid dynamic dispatch
 // I'm not sure how much this is effective
-pub (crate) enum Stream {
+pub(crate) enum Stream {
     Tcp(TcpStream),
     #[cfg(all(feature = "native-tls", not(feature = "rustls")))]
     Tls(tokio_native_tls::TlsStream<TcpStream>),
@@ -428,11 +428,11 @@ impl Client {
     /**
      * Returns a stream of the underlying transport. NOT a HTTP client
      */
-    pub (crate) async fn client<R: Rng>(
+    pub(crate) async fn client<R: Rng>(
         &self,
         url: &Url,
         rng: &mut R,
-        http_version: http::Version
+        http_version: http::Version,
     ) -> Result<(Instant, Stream), ClientError> {
         // TODO: Allow the connect timeout to be configured
         let timeout_duration = tokio::time::Duration::from_secs(5);
@@ -443,7 +443,8 @@ impl Client {
             // If we do not put a timeout here then the connections attempts will
             // linger long past the configured timeout
             let stream =
-                tokio::time::timeout(timeout_duration, self.tls_client(addr, url, http_version)).await;
+                tokio::time::timeout(timeout_duration, self.tls_client(addr, url, http_version))
+                    .await;
             return match stream {
                 Ok(Ok(stream)) => Ok((dns_lookup, stream)),
                 Ok(Err(err)) => Err(err),
@@ -495,7 +496,7 @@ impl Client {
         &self,
         addr: (std::net::IpAddr, u16),
         url: &Url,
-        http_version: http::Version
+        http_version: http::Version,
     ) -> Result<Stream, ClientError> {
         let stream = tokio::net::TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
@@ -510,12 +511,14 @@ impl Client {
         &self,
         stream: S,
         url: &Url,
-        http_version: http::Version
+        http_version: http::Version,
     ) -> Result<tokio_native_tls::TlsStream<S>, ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let connector = self.native_tls_connectors.connector(is_http2);
+        let connector = self
+            .native_tls_connectors
+            .connector(http_version >= http::Version::HTTP_2);
         let stream = connector
             .connect(url.host_str().ok_or(ClientError::HostNotFound)?, stream)
             .await?;
@@ -528,7 +531,7 @@ impl Client {
         &self,
         stream: S,
         url: &Url,
-        http_version: http::Version
+        http_version: http::Version,
     ) -> Result<Box<tokio_rustls::client::TlsStream<S>>, ClientError>
     where
         S: AsyncRead + AsyncWrite + Unpin,
@@ -549,7 +552,11 @@ impl Client {
         rng: &mut R,
     ) -> Result<(Instant, SendRequestHttp1), ClientError> {
         if let Some(proxy_url) = &self.proxy_url {
-            let http_proxy_version = if self.is_proxy_http2() { http::Version::HTTP_2 } else { http::Version:: HTTP_11 };
+            let http_proxy_version = if self.is_proxy_http2() {
+                http::Version::HTTP_2
+            } else {
+                http::Version::HTTP_11
+            };
             let (dns_lookup, stream) = self.client(proxy_url, rng, http_proxy_version).await?;
             if url.scheme() == "https" {
                 // Do CONNECT request to proxy
@@ -576,7 +583,9 @@ impl Client {
                     send_request.send_request(req).await?
                 };
                 let stream = hyper::upgrade::on(res).await?;
-                let stream = self.connect_tls(TokioIo::new(stream), url, self.http_version).await?;
+                let stream = self
+                    .connect_tls(TokioIo::new(stream), url, self.http_version)
+                    .await?;
                 let (send_request, conn) =
                     hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
                 tokio::spawn(conn);
@@ -592,7 +601,7 @@ impl Client {
     }
 
     #[inline]
-    pub (crate) fn request(&self, url: &Url) -> Result<http::Request<Full<Bytes>>, ClientError> {
+    pub(crate) fn request(&self, url: &Url) -> Result<http::Request<Full<Bytes>>, ClientError> {
         let use_proxy = self.proxy_url.is_some() && url.scheme() == "http";
 
         let mut builder = http::Request::builder()
@@ -746,7 +755,11 @@ impl Client {
         rng: &mut R,
     ) -> Result<(ConnectionTime, SendRequestHttp2), ClientError> {
         if let Some(proxy_url) = &self.proxy_url {
-            let http_proxy_version = if self.is_proxy_http2() { http::Version::HTTP_2 } else { http::Version:: HTTP_11 };
+            let http_proxy_version = if self.is_proxy_http2() {
+                http::Version::HTTP_2
+            } else {
+                http::Version::HTTP_11
+            };
             let (dns_lookup, stream) = self.client(proxy_url, rng, http_proxy_version).await?;
             if url.scheme() == "https" {
                 let req = {
@@ -772,7 +785,9 @@ impl Client {
                     send_request.send_request(req).await?
                 };
                 let stream = hyper::upgrade::on(res).await?;
-                let stream = self.connect_tls(TokioIo::new(stream), url, http::Version::HTTP_2).await?;
+                let stream = self
+                    .connect_tls(TokioIo::new(stream), url, http::Version::HTTP_2)
+                    .await?;
                 let (send_request, conn) =
                     hyper::client::conn::http2::Builder::new(TokioExecutor::new())
                         // from nghttp2's default
@@ -1002,8 +1017,6 @@ pub async fn work_debug<W: Write>(w: &mut W, client: Arc<Client>) -> Result<(), 
     writeln!(w, "{:#?}", request)?;
 
     let response = match client.work_type() {
-
-
         HttpWorkType::H2 => {
             let (_, mut client_state) = client.connect_http2(&url, &mut rng).await?;
             client_state.send_request(request).await?
@@ -1042,14 +1055,16 @@ pub async fn work(
         Ok::<(), kanal::SendError>(())
     };
 
-    let futures = match client.work_type()  {
+    let futures = match client.work_type() {
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx, client, None).await,
-        HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
+        HttpWorkType::H2 => {
+            parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await
+        }
     };
     n_tasks_emitter.await.unwrap();
     for f in futures {
         let _ = f.await;
-    };
+    }
 }
 
 /// n tasks by m workers limit to qps works in a second
@@ -1100,14 +1115,16 @@ pub async fn work_with_qps(
     };
 
     let rx = rx.to_async();
-    let futures = match client.work_type()  {
+    let futures = match client.work_type() {
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx, client, None).await,
-        HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
+        HttpWorkType::H2 => {
+            parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await
+        }
     };
     work_queue.await.unwrap();
     for f in futures {
         let _ = f.await;
-    };
+    }
 }
 
 async fn parallel_work_http1(
@@ -1148,7 +1165,7 @@ async fn parallel_work_http1(
         is_end.store(true, Relaxed);
     };
 
-    return futures;
+    futures
 }
 
 async fn parallel_work_http2(
@@ -1157,105 +1174,103 @@ async fn parallel_work_http2(
     rx: AsyncReceiver<Option<Instant>>,
     report_tx: kanal::Sender<Result<RequestResult, ClientError>>,
     client: Arc<Client>,
-    deadline: Option<std::time::Instant>
+    deadline: Option<std::time::Instant>,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-
     // Using semaphore to control the deadline
     // Maybe there is a better concurrent primitive to do this
     let s = Arc::new(tokio::sync::Semaphore::new(0));
     let has_deadline = deadline.is_some();
 
     let futures = (0..n_connections)
-    .map(|_| {
-        let report_tx = report_tx.clone();
-        let rx = rx.clone();
-        let client = client.clone();
-        let s = s.clone();
-        tokio::spawn(async move {
+        .map(|_| {
+            let report_tx = report_tx.clone();
+            let rx = rx.clone();
+            let client = client.clone();
             let s = s.clone();
-            loop {
-                match setup_http2(&client).await {
-                    Ok((connection_time, send_request)) => {
-                        let futures = (0..n_http2_parallel)
-                            .map(|_| {
-                                let report_tx = report_tx.clone();
-                                let rx = rx.clone();
-                                let client = client.clone();
-                                let mut client_state = ClientStateHttp2 {
-                                    rng: SeedableRng::from_os_rng(),
-                                    send_request: send_request.clone(),
-                                };
-                                let s = s.clone();
-                                tokio::spawn(async move {
-                                    // This is where HTTP2 loops to make all the requests for a given client and worker
-                                    while let Ok(start_time_option) = rx.recv().await {
-                                        let (is_cancel, is_reconnect) = work_http2_once(
-                                            &client,
-                                            &mut client_state,
-                                            &report_tx,
-                                            connection_time,
-                                            start_time_option,
-                                        )
-                                        .await;
+            tokio::spawn(async move {
+                let s = s.clone();
+                loop {
+                    match setup_http2(&client).await {
+                        Ok((connection_time, send_request)) => {
+                            let futures = (0..n_http2_parallel)
+                                .map(|_| {
+                                    let report_tx = report_tx.clone();
+                                    let rx = rx.clone();
+                                    let client = client.clone();
+                                    let mut client_state = ClientStateHttp2 {
+                                        rng: SeedableRng::from_os_rng(),
+                                        send_request: send_request.clone(),
+                                    };
+                                    let s = s.clone();
+                                    tokio::spawn(async move {
+                                        // This is where HTTP2 loops to make all the requests for a given client and worker
+                                        while let Ok(start_time_option) = rx.recv().await {
+                                            let (is_cancel, is_reconnect) = work_http2_once(
+                                                &client,
+                                                &mut client_state,
+                                                &report_tx,
+                                                connection_time,
+                                                start_time_option,
+                                            )
+                                            .await;
 
-                                        let is_cancel = is_cancel || s.is_closed();
-                                        if is_cancel || is_reconnect {
-                                            return is_cancel;
+                                            let is_cancel = is_cancel || s.is_closed();
+                                            if is_cancel || is_reconnect {
+                                                return is_cancel;
+                                            }
                                         }
-                                    }
-                                    true
+                                        true
+                                    })
                                 })
-                            })
-                            .collect::<Vec<_>>();
-                        let mut connection_gone = false;
-                        for f in futures {
-                            tokio::select! {
-                                r = f => {
-                                    match r {
-                                        Ok(true) => {
-                                            // All works done
-                                            connection_gone = true;
+                                .collect::<Vec<_>>();
+                            let mut connection_gone = false;
+                            for f in futures {
+                                tokio::select! {
+                                    r = f => {
+                                        match r {
+                                            Ok(true) => {
+                                                // All works done
+                                                connection_gone = true;
+                                            }
+                                            Err(_) => {
+                                                // Unexpected
+                                                connection_gone = true;
+                                            }
+                                            _ => {}
                                         }
-                                        Err(_) => {
-                                            // Unexpected
-                                            connection_gone = true;
-                                        }
-                                        _ => {}
                                     }
-                                }
-                                _ = s.acquire() => {
-                                    report_tx.send(Err(ClientError::Deadline)).unwrap();
-                                    connection_gone = true;
+                                    _ = s.acquire() => {
+                                        report_tx.send(Err(ClientError::Deadline)).unwrap();
+                                        connection_gone = true;
+                                    }
                                 }
                             }
+                            if connection_gone {
+                                return;
+                            }
                         }
-                        if connection_gone {
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        if s.is_closed() {
-                            break;
-                            // Consume a task 
-                        } else if rx.recv().await.is_ok() {
-                            report_tx.send(Err(err)).unwrap();
-                        } else {
-                            return;
+                        Err(err) => {
+                            if s.is_closed() {
+                                break;
+                                // Consume a task
+                            } else if rx.recv().await.is_ok() {
+                                report_tx.send(Err(err)).unwrap();
+                            } else {
+                                return;
+                            }
                         }
                     }
                 }
-            }
+            })
         })
-    })
-    .collect::<Vec<_>>();
+        .collect::<Vec<_>>();
 
     if has_deadline {
         tokio::time::sleep_until(deadline.unwrap().into()).await;
         s.close();
     }
 
-    return futures;
-
+    futures
 }
 
 /// n tasks by m workers limit to qps works in a second with latency correction
@@ -1309,14 +1324,16 @@ pub async fn work_with_qps_latency_correction(
         Ok::<(), kanal::SendError>(())
     };
 
-    let futures = match client.work_type()  {
+    let futures = match client.work_type() {
         HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx, client, None).await,
-        HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await,
+        HttpWorkType::H2 => {
+            parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx, client, None).await
+        }
     };
     work_queue.await.unwrap();
     for f in futures {
         let _ = f.await;
-    };
+    }
 }
 
 /// Run until dead_line by n workers
@@ -1333,8 +1350,27 @@ pub async fn work_until(
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let emitter_handle = endless_emitter(cancel_token.clone(), tx).await;
     let futures = match client.work_type() {
-        HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
-        HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
+        HttpWorkType::H2 => {
+            parallel_work_http2(
+                n_connections,
+                n_http2_parallel,
+                rx,
+                report_tx.clone(),
+                client.clone(),
+                Some(dead_line),
+            )
+            .await
+        }
+        HttpWorkType::H1 => {
+            parallel_work_http1(
+                n_connections,
+                rx,
+                report_tx.clone(),
+                client.clone(),
+                Some(dead_line),
+            )
+            .await
+        }
     };
     if client.work_type() == HttpWorkType::H1 && !wait_ongoing_requests_after_deadline {
         for f in futures {
@@ -1354,7 +1390,6 @@ pub async fn work_until(
     cancel_token.cancel();
     // Wait for the emitter to exit cleanly
     let _ = emitter_handle.await;
-
 }
 
 async fn endless_emitter(
@@ -1429,8 +1464,27 @@ pub async fn work_until_with_qps(
 
     let rx = rx.to_async();
     let futures = match client.work_type() {
-        HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
-        HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
+        HttpWorkType::H2 => {
+            parallel_work_http2(
+                n_connections,
+                n_http2_parallel,
+                rx,
+                report_tx.clone(),
+                client.clone(),
+                Some(dead_line),
+            )
+            .await
+        }
+        HttpWorkType::H1 => {
+            parallel_work_http1(
+                n_connections,
+                rx,
+                report_tx.clone(),
+                client.clone(),
+                Some(dead_line),
+            )
+            .await
+        }
     };
     if client.work_type() == HttpWorkType::H1 && !wait_ongoing_requests_after_deadline {
         for f in futures {
@@ -1499,8 +1553,27 @@ pub async fn work_until_with_qps_latency_correction(
 
     let rx = rx.to_async();
     let futures = match client.work_type() {
-        HttpWorkType::H2 => parallel_work_http2(n_connections, n_http2_parallel, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
-        HttpWorkType::H1 => parallel_work_http1(n_connections, rx, report_tx.clone(), client.clone(), Some(dead_line)).await,
+        HttpWorkType::H2 => {
+            parallel_work_http2(
+                n_connections,
+                n_http2_parallel,
+                rx,
+                report_tx.clone(),
+                client.clone(),
+                Some(dead_line),
+            )
+            .await
+        }
+        HttpWorkType::H1 => {
+            parallel_work_http1(
+                n_connections,
+                rx,
+                report_tx.clone(),
+                client.clone(),
+                Some(dead_line),
+            )
+            .await
+        }
     };
     if client.work_type() == HttpWorkType::H1 && !wait_ongoing_requests_after_deadline {
         for f in futures {
@@ -1520,25 +1593,23 @@ pub async fn work_until_with_qps_latency_correction(
 
 /**
  * Optimized workers for `--no-tui` mode
- * These workers will all run on a single thread and are not `async`. 
+ * These workers will all run on a single thread and are not `async`.
  * Reduces tokio synchronisation overhead.
  */
 pub mod fast {
-    use std::sync::{atomic::{AtomicBool, AtomicIsize, Ordering}, Arc};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicIsize, Ordering},
+    };
 
     use rand::SeedableRng;
 
     use crate::{
         client::{
-            is_cancel_error,
-            is_hyper_error,
-            set_connection_time,
-            setup_http2,
-            ClientError,
-            ClientStateHttp1,
-            ClientStateHttp2,
-            HttpWorkType
-        }, result_data::ResultData
+            ClientError, ClientStateHttp1, ClientStateHttp2, HttpWorkType, is_cancel_error,
+            is_hyper_error, set_connection_time, setup_http2,
+        },
+        result_data::ResultData,
     };
 
     use super::Client;
@@ -1568,23 +1639,40 @@ pub mod fast {
         });
         let token = tokio_util::sync::CancellationToken::new();
         let handles = connections
-        .map(|num_connections| {
-            let report_tx = report_tx.clone();
-            let client = client.clone();
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let token = token.clone();
-            let counter = counter.clone();
-            // will let is_end just stay false permanently
-            let is_end = Arc::new(AtomicBool::new(false));
-            std::thread::spawn(move || match client.work_type() {
-                HttpWorkType::H2 => http2_connection_fast_work_until(num_connections, n_http_parallel, report_tx, client, token,  Some(counter), is_end, rt),
-                HttpWorkType::H1 => http1_connection_fast_work_until(num_connections, report_tx, client, token, Some(counter), is_end, rt)
+            .map(|num_connections| {
+                let report_tx = report_tx.clone();
+                let client = client.clone();
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let token = token.clone();
+                let counter = counter.clone();
+                // will let is_end just stay false permanently
+                let is_end = Arc::new(AtomicBool::new(false));
+                std::thread::spawn(move || match client.work_type() {
+                    HttpWorkType::H2 => http2_connection_fast_work_until(
+                        num_connections,
+                        n_http_parallel,
+                        report_tx,
+                        client,
+                        token,
+                        Some(counter),
+                        is_end,
+                        rt,
+                    ),
+                    HttpWorkType::H1 => http1_connection_fast_work_until(
+                        num_connections,
+                        report_tx,
+                        client,
+                        token,
+                        Some(counter),
+                        is_end,
+                        rt,
+                    ),
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
         tokio::spawn(async move {
             tokio::signal::ctrl_c().await.unwrap();
@@ -1635,8 +1723,25 @@ pub mod fast {
                 let token = token.clone();
                 let is_end = is_end.clone();
                 std::thread::spawn(move || match client.work_type() {
-                    HttpWorkType::H2 => http2_connection_fast_work_until(num_connections, n_http_parallel, report_tx, client, token, None, is_end, rt),
-                    HttpWorkType::H1 => http1_connection_fast_work_until(num_connections, report_tx, client, token, None, is_end, rt)
+                    HttpWorkType::H2 => http2_connection_fast_work_until(
+                        num_connections,
+                        n_http_parallel,
+                        report_tx,
+                        client,
+                        token,
+                        None,
+                        is_end,
+                        rt,
+                    ),
+                    HttpWorkType::H1 => http1_connection_fast_work_until(
+                        num_connections,
+                        report_tx,
+                        client,
+                        token,
+                        None,
+                        is_end,
+                        rt,
+                    ),
                 })
             })
             .collect::<Vec<_>>();
@@ -1663,8 +1768,9 @@ pub mod fast {
      * Generalised HTTP2 work function. Can be terminated in the following ways:
      *  * Set `is_end` to true. This happens when we reach a 'deadline', or are counting for a fixed period of time.
      *  * The cancellation token can also be triggered for a similar effect. These can likely be combined into one in a future CR.
-     *  * pass a value for n_tasks. it will use the counter to count up to that number of requests, and terminate.
+     *  * pass a value for counter. It will count down to 0, and terminate.
      */
+    #[allow(clippy::too_many_arguments)]
     fn http2_connection_fast_work_until(
         num_connections: usize,
         n_http_parallel: usize,
@@ -1707,20 +1813,21 @@ pub mod fast {
 
                                         let work = async {
                                             loop {
-                                                if is_counting_tasks {
-                                                    if counter.as_ref().unwrap().fetch_sub(1, Ordering::Relaxed) <= 0  {
-                                                        return true;
-                                                    }
+                                                if is_counting_tasks
+                                                    && counter
+                                                        .as_ref()
+                                                        .unwrap()
+                                                        .fetch_sub(1, Ordering::Relaxed)
+                                                        <= 0
+                                                {
+                                                    return true;
                                                 }
-                                                let mut res = client
-                                                    .work_http2(&mut client_state)
-                                                    .await;
-                                                let is_cancel = is_cancel_error(&res) || is_end.load(Ordering::Relaxed);
+                                                let mut res =
+                                                    client.work_http2(&mut client_state).await;
+                                                let is_cancel = is_cancel_error(&res)
+                                                    || is_end.load(Ordering::Relaxed);
                                                 let is_reconnect = is_hyper_error(&res);
-                                                set_connection_time(
-                                                    &mut res,
-                                                    connection_time,
-                                                );
+                                                set_connection_time(&mut res, connection_time);
 
                                                 result_data.push(res);
 
@@ -1768,8 +1875,11 @@ pub mod fast {
                         Err(err) => {
                             has_err = true;
                             result_data_err.push(Err(err));
-                            if is_end.load(Ordering::Relaxed) ||
-                             (is_counting_tasks && counter.as_ref().unwrap().fetch_sub(1, Ordering::Relaxed) <= 0)  {
+                            if is_end.load(Ordering::Relaxed)
+                                || (is_counting_tasks
+                                    && counter.as_ref().unwrap().fetch_sub(1, Ordering::Relaxed)
+                                        <= 0)
+                            {
                                 break;
                             }
                         }
@@ -1808,10 +1918,10 @@ pub mod fast {
                 let work = async {
                     let mut client_state = ClientStateHttp1::default();
                     loop {
-                        if is_counting_tasks {
-                            if counter.as_ref().unwrap().fetch_sub(1, Ordering::Relaxed) <= 0 {
-                                break;
-                            }
+                        if is_counting_tasks
+                            && counter.as_ref().unwrap().fetch_sub(1, Ordering::Relaxed) <= 0
+                        {
+                            break;
                         }
                         let res = client.work_http1(&mut client_state).await;
                         let is_cancel = is_cancel_error(&res);
@@ -1834,5 +1944,4 @@ pub mod fast {
         }
         rt.block_on(local);
     }
-
 }
