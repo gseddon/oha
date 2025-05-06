@@ -29,6 +29,8 @@ use url_generator::UrlGenerator;
 
 mod aws_auth;
 mod client;
+#[cfg(feature = "http3")]
+mod client_h3;
 mod db;
 mod histogram;
 mod monitor;
@@ -184,7 +186,7 @@ Note: If qps is specified, burst will be ignored",
     )]
     proxy_http2: bool,
     #[arg(
-        help = "HTTP version. Available values 0.9, 1.0, 1.1, 2.",
+        help = "HTTP version. Available values 0.9, 1.0, 1.1, 2, 3",
         long = "http-version"
     )]
     http_version: Option<String>,
@@ -377,8 +379,8 @@ pub async fn run(mut opts: Opts) -> anyhow::Result<()> {
             "1.0" => Ok(http::Version::HTTP_10),
             "1.1" => Ok(http::Version::HTTP_11),
             "2.0" | "2" => Ok(http::Version::HTTP_2),
-            "3.0" | "3" => anyhow::bail!("HTTP/3 is not supported yet."),
-            _ => anyhow::bail!("Unknown HTTP version. Valid versions are 0.9, 1.0, 1.1, 2."),
+            "3.0" | "3" => Ok(http::Version::HTTP_3),
+            _ => anyhow::bail!("Unknown HTTP version. Valid versions are 0.9, 1.0, 1.1, 2, 3"),
         },
         (false, None) => Ok(http::Version::HTTP_11),
     };
@@ -466,7 +468,7 @@ pub async fn run(mut opts: Opts) -> anyhow::Result<()> {
 
         if let Some(h) = opts.host {
             headers.insert(http::header::HOST, HeaderValue::from_bytes(h.as_bytes())?);
-        } else if http_version != http::Version::HTTP_2 {
+        } else if http_version < http::Version::HTTP_2 {
             headers.insert(
                 http::header::HOST,
                 http::header::HeaderValue::from_str(url.authority())?,

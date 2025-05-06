@@ -1,8 +1,10 @@
 use hyper::http;
+use rustls::crypto::CryptoProvider;
 #[cfg(feature = "rustls")]
 pub struct RuslsConfigs {
     no_alpn: std::sync::Arc<rustls::ClientConfig>,
     alpn_h2: std::sync::Arc<rustls::ClientConfig>,
+    alpn_h3: std::sync::Arc<rustls::ClientConfig>,
 }
 
 #[cfg(feature = "rustls")]
@@ -27,6 +29,7 @@ impl RuslsConfigs {
             }
         }
 
+        let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
         let builder = rustls::ClientConfig::builder().with_root_certificates(root_cert_store);
 
         let mut config = if let Some((cert, key)) = client_auth {
@@ -47,11 +50,15 @@ impl RuslsConfigs {
 
         let mut no_alpn = config.clone();
         no_alpn.alpn_protocols = vec![];
-        let mut alpn_h2 = config;
+        let mut alpn_h2 = config.clone();
         alpn_h2.alpn_protocols = vec![b"h2".to_vec()];
+        let mut alpn_h3 = config;
+        alpn_h3.alpn_protocols =vec![b"h3".to_vec()];
+        alpn_h3.enable_early_data = true;
         Self {
             no_alpn: Arc::new(no_alpn),
             alpn_h2: Arc::new(alpn_h2),
+            alpn_h3: Arc::new(alpn_h3)
         }
     }
 
@@ -59,6 +66,7 @@ impl RuslsConfigs {
         match http {
             http::Version::HTTP_09 | http::Version::HTTP_10 | http::Version::HTTP_11 => &self.no_alpn,
             http::Version::HTTP_2 => &self.alpn_h2,
+            http::Version::HTTP_3 => &self.alpn_h3,
             _ => panic!("nonsupported HTTP version")
         }
     }
