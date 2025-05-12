@@ -1143,8 +1143,8 @@ async fn parallel_work_http1(
             let rx = rx.clone();
             let client = client.clone();
             let is_end = is_end.clone();
+            let mut client_state = ClientStateHttp1::default();
             tokio::spawn(async move {
-                let mut client_state = ClientStateHttp1::default();
                 while let Ok(rx_value) = rx.recv().await {
                     let mut res = client.work_http1(&mut client_state).await;
                     if let Some(start_latency_correction) = rx_value {
@@ -1152,7 +1152,7 @@ async fn parallel_work_http1(
                     }
                     let is_cancel = is_cancel_error(&res);
                     report_tx.send(res).unwrap();
-                    if is_cancel || has_deadline || is_end.load(Relaxed) {
+                    if is_cancel || is_end.load(Relaxed) {
                         break;
                     }
                 }
